@@ -13,7 +13,8 @@ import pytest
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
-from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.platforms import current_platform
+from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -22,8 +23,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheTensor,
     MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
     compute_layout_strides,
 )
+from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.gpu import attn_utils
 from vllm.v1.worker.gpu.attn_utils import (
     get_attn_cg_support,
@@ -33,6 +36,7 @@ from vllm.v1.worker.utils import (
     AttentionGroup,
     allocate_kv_cache,
     copy_kv_cache_blocks_inplace,
+    prepare_kernel_block_sizes,
 )
 
 
@@ -253,6 +257,75 @@ def test_allocate_compressed_mla_cache(
     )
 
     assert caches["layer.0"].shape == (expected_num_blocks, 1, expected_num_states, 128)
+
+
+class _StoragePageBackend:
+    @classmethod
+    def get_supported_kernel_block_sizes(cls) -> list[MultipleOf]:
+        return [MultipleOf(16)]
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("is_rocm", "storage_block_size", "uniform", "expected_kernel_size"),
+    [
+        pytest.param(True, 128, False, 128, id="rocm-storage-pages"),
+        pytest.param(True, 128, True, 128, id="rocm-uniform-storage-pages"),
+        pytest.param(False, 128, False, 640, id="non-rocm-unchanged"),
+        pytest.param(True, None, False, 640, id="rocm-no-override"),
+    ],
+)
+def test_prepare_kernel_block_sizes_maps_mla_storage_pages(
+    monkeypatch: pytest.MonkeyPatch,
+    is_rocm: bool,
+    storage_block_size: int | None,
+    uniform: bool,
+    expected_kernel_size: int,
+):
+    """Indexer block IDs must address the physical pages selected for storage."""
+    monkeypatch.setattr(current_platform, "is_rocm", lambda: is_rocm)
+    spec = MLAAttentionSpec(
+        block_size=640,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        tokens_per_state=4,
+        storage_block_size=storage_block_size,
+    )
+    group_spec = (
+        UniformTypeKVCacheSpecs(block_size=640, kv_cache_specs={"layer.0": spec})
+        if uniform
+        else spec
+    )
+    config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer.0"], group_spec)],
+    )
+    group = AttentionGroup(
+        _StoragePageBackend,  # type: ignore[arg-type]
+        ["layer.0"],
+        spec,
+        0,
+    )
+    kernel_block_sizes = prepare_kernel_block_sizes(config, [[group]])
+    assert kernel_block_sizes == [expected_kernel_size]
+
+    table = BlockTable(
+        block_size=640,
+        max_num_reqs=2,
+        max_num_blocks_per_req=2,
+        max_num_batched_tokens=1,
+        pin_memory=False,
+        device=torch.device("cpu"),
+        kernel_block_size=kernel_block_sizes[0],
+        cp_kv_cache_interleave_size=1,
+    )
+    table.add_row([1, 3], row_idx=0)
+    expected_ids = (
+        [5, 6, 7, 8, 9, 15, 16, 17, 18, 19] if expected_kernel_size == 128 else [1, 3]
+    )
+    assert table.get_numpy_array()[0, : len(expected_ids)].tolist() == expected_ids
 
 
 @pytest.mark.parametrize("layout", list(KVCacheLayout))
